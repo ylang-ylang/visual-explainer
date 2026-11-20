@@ -4,6 +4,65 @@
 
 # visual-explainer
 
+## Maintained fork: remote MCP + Web UI
+
+This is [ylang-ylang's fork](https://github.com/ylang-ylang/visual-explainer) of
+[nicobailon/visual-explainer](https://github.com/nicobailon/visual-explainer).
+The original skill, prompts and renderer remain under `plugins/visual-explainer/`.
+The additions in **`remote-app/` are fork features, not an upstream Web UI**:
+
+- Bearer-authenticated Streamable HTTP MCP at `/mcp`, retaining the original tools, resources and prompts.
+- A private visual library at `/`: history, search, interactive preview, desktop/mobile widths, fullscreen and standalone viewing.
+- Persistent HTML/source files and signed per-page browser links. New agent renders appear in the library automatically.
+- No model API, credentials or inference on the server. The working agent inspects its project and supplies HTML.
+
+### Run this fork with Docker / TrueNAS
+
+Build from the repository root; the image copies the renderer from **this checkout**:
+
+```sh
+docker build --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" -t visual-explainer-fork:1.1.0 .
+```
+
+Create a persistent data directory owned by UID/GID `1000:1000` and a random token
+file (at least 32 characters), readable by UID 1000 only. Configure these values
+in a private `.env`, never in Git:
+
+```dotenv
+PUBLIC_URL=http://your-server:8080
+BIND_IP=0.0.0.0
+PORT=8080
+DATA_PATH=/absolute/path/to/diagrams
+TOKEN_PATH=/absolute/path/to/api.token
+```
+
+Run `docker compose up -d`, or import `compose.yaml` as a TrueNAS Custom App after
+building/importing the image and replacing its environment placeholders.
+Agents connect to `${PUBLIC_URL}/mcp` with `Authorization: Bearer <token>`.
+Read the `visual-explainer://skill/SKILL.md` resource, inspect the project locally,
+then call `visual_explainer_render_html` with `html` and a basename `filename`.
+The result includes a browser URL; local project paths are not accepted remotely.
+
+Open `${PUBLIC_URL}/` and log in with the token. A read-only viewer key is
+`HMAC-SHA256(token, "viewer-access")` in hexadecimal. Opening
+`${PUBLIC_URL}/?access=<viewer-key>` establishes a seven-day HttpOnly read-only
+session and redirects to a clean URL. A viewer link grants access to the whole
+library; a page link grants access to that page. Keep both private.
+
+The service token, existing data directory and URLs survive image upgrades.
+Reusing a filename replaces its page; use unique filenames to preserve reports.
+Rotating the token invalidates viewer sessions and all existing links.
+Use TLS or an encrypted tunnel outside trusted networks.
+Generated pages run in sandboxed frames. Executable Node state-machine models
+remain disabled; repository citation checks and video export need local project
+access and are not provided as remote tools.
+
+The bundled Chinese web font is derived from Debian `fonts-wqy-zenhei` using
+fonttools 4.68.0 (`pyftsubset wqy-zenhei.ttc --font-number=0 --unicodes=U+0000-FFFF
+--flavor=woff2 --output-file=cjk.woff2`); its license is included alongside the asset.
+
+The documentation below describes the original upstream skill and local integrations.
+
 **An agent skill that turns complex terminal output into styled HTML pages you actually want to read.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)

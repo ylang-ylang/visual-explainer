@@ -1,5 +1,12 @@
 # Changelog
 
+## Fork remote app 1.1.0 - 2026-11-20
+
+- Added `remote-app/`: authenticated remote MCP, signed page links and a private human-facing visual library.
+- Added history/search, interactive iframe previews, desktop/mobile sizes, fullscreen and self-hosted Chinese fonts.
+- Added a root Dockerfile and Compose template that build the renderer from this fork checkout, without downloading a separate upstream archive.
+- Kept model inference on the working agent, disabled server-side executable models, and retained the original local skill/MCP integrations.
+
 ## [0.15.0] - 2026-11-04
 
 ### Highlights
