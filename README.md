@@ -14,6 +14,7 @@ The additions in **`remote-app/` are fork features, not an upstream Web UI**:
 - Bearer-authenticated Streamable HTTP MCP at `/mcp`, retaining the original tools, resources and prompts.
 - A private, light, full-window visual library at `/`: collapsible desktop navigation, a mobile library drawer, history, search, interactive preview, desktop/mobile widths, fullscreen and standalone viewing.
 - Persistent HTML/source files and signed per-page browser links. New agent renders appear in the library automatically.
+- Entity grouping: one entity can contain multiple diagrams, with HTTP management APIs and optional MCP `entityId`.
 - No model API, credentials or inference on the server. The working agent inspects its project and supplies HTML.
 
 ### Run this fork with Docker / TrueNAS
@@ -56,6 +57,58 @@ Use TLS or an encrypted tunnel outside trusted networks.
 Generated pages run in sandboxed frames. Executable Node state-machine models
 remain disabled; repository citation checks and video export need local project
 access and are not provided as remote tools.
+
+### Entities and HTTP API
+
+Entities are logical groups, not separate permissions or filename namespaces.
+Each diagram belongs to one entity or is unassigned. Existing diagrams start
+unassigned; moving one preserves its HTML, modification time and signed URL.
+Filenames remain globally unique across entities.
+
+Read endpoints accept the viewer session or service Bearer token. Mutations
+require the **service token**; a viewer key/session cannot write.
+
+| Method | Endpoint | JSON body / result |
+|---|---|---|
+| GET | `/api/entities` | `{entities, unassignedCount, totalCount}`; entities include `diagramCount` |
+| POST | `/api/entities` | `{id, name}`; creates a group |
+| PATCH | `/api/entities/:id` | `{name}`; rename without changing its ID |
+| DELETE | `/api/entities/:id` | Empty groups only; nonempty returns 409 |
+| GET | `/api/pages?entityId=cosmos` | `{pages}`; omit filter for all, empty value for unassigned |
+| GET | `/api/pages/:filename` | `{page}` including nullable `entityId` |
+| PUT | `/api/pages/:filename` | `{html, entityId?}`; render/create or replace; returns `{page, render}` |
+| PATCH | `/api/pages/:filename` | `{entityId}`; move, or `null` to unassign |
+
+Entity IDs are stable lowercase slugs (1–64 letters/digits, `_` or `-`, starting
+with a letter/digit). Names contain 1–120 characters. HTTP render filenames must
+be canonical `.html`/`.htm` basenames, not `.src.html` files. Errors return
+`{error}` with HTTP 400/401/403/404/409/413 as appropriate.
+
+For example, with `BASE_URL` and `VE_TOKEN` set privately:
+
+```sh
+curl --fail-with-body "$BASE_URL/api/entities" \
+  -H "Authorization: Bearer $VE_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"id":"cosmos","name":"Cosmos"}'
+
+curl --fail-with-body -X PATCH "$BASE_URL/api/pages/cosmos-attention.html" \
+  -H "Authorization: Bearer $VE_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"entityId":"cosmos"}'
+
+jq -n --rawfile html architecture.html '{html:$html,entityId:"cosmos"}' |
+  curl --fail-with-body -X PUT "$BASE_URL/api/pages/cosmos-architecture.html" \
+    -H "Authorization: Bearer $VE_TOKEN" -H 'Content-Type: application/json' --data-binary @-
+```
+
+MCP `visual_explainer_render_html` accepts the same optional `entityId`.
+Omitting it preserves an existing diagram's group; a new diagram is unassigned.
+Explicit `null` removes the assignment. Unknown entities are rejected before
+rendering. The library's entity selector includes empty groups and updates
+automatically without resetting an unchanged diagram's playback.
+
+The versioned `.entities.json` catalog is persisted atomically alongside HTML
+under the data volume; back it up with the whole directory. Invalid catalogs
+stop startup rather than silently discarding grouping.
 
 The bundled Chinese web font is derived from Debian `fonts-wqy-zenhei` using
 fonttools 4.68.0 (`pyftsubset wqy-zenhei.ttc --font-number=0 --unicodes=U+0000-FFFF

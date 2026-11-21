@@ -1,5 +1,11 @@
 # Changelog
 
+## Fork entity grouping - 2026-11-21
+
+- Added persistent named entities, each containing multiple diagrams, with an entity selector in the library.
+- Added authenticated HTTP entity management, diagram publishing, listing and reassignment; MCP rendering accepts optional `entityId`.
+- Preserved existing URLs, diagram HTML and playback when changing group membership; viewer sessions remain read-only.
+
 ## Fork UI refresh - 2026-11-21
 
 - Replaced the gallery with a light, full-window reader: collapsible desktop navigation and a mobile library drawer.

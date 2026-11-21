@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { constants } from 'node:fs';
 import { readFile, lstat, readdir, open } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -11,6 +12,7 @@ import {
   ReadResourceRequestSchema, ListPromptsRequestSchema, GetPromptRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { parse } from 'node-html-parser';
+import { ApiError, canonicalFilename, createCatalog, pageFilename } from './catalog.mjs';
 
 const publicUrl = new URL(process.env.PUBLIC_URL);
 const outputDir = resolve(process.env.VISUAL_EXPLAINER_OUTPUT_DIR ?? '/data');
@@ -24,6 +26,7 @@ const cjkFont = await readFile(new URL('./static/cjk.woff2', import.meta.url));
 const cjkLicense = await readFile(new URL('./static/LICENSE.fonts-wqy-zenhei', import.meta.url));
 const viewerKey = createHmac('sha256', token).update('viewer-access').digest('hex');
 const sessionLifetime = 7 * 24 * 60 * 60;
+const catalog = await createCatalog(outputDir);
 
 function sessionSignature(expires) {
   return createHmac('sha256', token).update(`viewer-session:${expires}`).digest('hex');
@@ -39,22 +42,35 @@ function setViewerSession(res) {
   const expires = Math.floor(Date.now() / 1000) + sessionLifetime;
   res.setHeader('Set-Cookie', `ve_viewer=${expires}.${sessionSignature(expires)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${sessionLifetime}${publicUrl.protocol === 'https:' ? '; Secure' : ''}`);
 }
+async function readPage(filename) {
+  let handle;
+  try {
+    handle = await open(join(outputDir, filename), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const info = await handle.stat();
+    if (!info.isFile()) return null;
+    const buffer = Buffer.alloc(Math.min(16384, info.size));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const title = parse(buffer.subarray(0, bytesRead).toString('utf8')).querySelector('title')?.textContent.trim() || filename;
+    return { filename, title, modified: info.mtime.toISOString(), bytes: info.size, url: pageUrl(filename), entityId: catalog.assignment(filename) };
+  } catch (error) {
+    if (['ENOENT', 'ELOOP', 'ENOTDIR'].includes(error.code)) return null;
+    throw error;
+  } finally { await handle?.close(); }
+}
+
+async function requirePage(filename) {
+  pageFilename(filename);
+  const page = await readPage(filename);
+  if (!page) throw new ApiError(404, 'Page not found');
+  return page;
+}
+
 async function listPages() {
   const pages = [];
   for (const entry of await readdir(outputDir, { withFileTypes: true })) {
     if (!entry.isFile() || !/\.html?$/i.test(entry.name) || /\.src\.html?$/i.test(entry.name)) continue;
-    const path = join(outputDir, entry.name);
-    let handle;
-    try {
-      handle = await open(path, 'r');
-      const info = await handle.stat();
-      const buffer = Buffer.alloc(Math.min(16384, info.size));
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-      const title = parse(buffer.subarray(0, bytesRead).toString('utf8')).querySelector('title')?.textContent.trim() || entry.name;
-      pages.push({ filename: entry.name, title, modified: info.mtime.toISOString(), bytes: info.size, url: pageUrl(entry.name) });
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    } finally { await handle?.close(); }
+    const page = await readPage(entry.name);
+    if (page) pages.push(page);
   }
   return pages.sort((a, b) => b.modified.localeCompare(a.modified));
 }
@@ -72,6 +88,53 @@ function pageUrl(filename) {
 function send(res, status, text, type = 'text/plain; charset=utf-8') {
   res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
   res.end(text);
+}
+function json(res, status, body) {
+  return send(res, status, JSON.stringify(body), 'application/json; charset=utf-8');
+}
+
+async function readBody(req, limit) {
+  const length = req.headers['content-length'];
+  if (length !== undefined && (!/^\d+$/.test(length) || Number(length) > limit)) {
+    req.resume();
+    throw new ApiError(413, 'Request too large');
+  }
+  const chunks = [];
+  let size = 0;
+  try {
+    // Returning early must not destroy the socket before the JSON error is sent.
+    for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+      size += chunk.length;
+      if (size > limit) throw new ApiError(413, 'Request too large');
+      chunks.push(chunk);
+    }
+  } catch (error) {
+    req.resume();
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, 'Incomplete request body');
+  }
+  return Buffer.concat(chunks, size).toString('utf8');
+}
+
+async function readJson(req, limit) {
+  let body;
+  try { body = JSON.parse(await readBody(req, limit)); }
+  catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, 'Invalid JSON');
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new ApiError(400, 'Expected a JSON object');
+  return body;
+}
+
+function fields(body, allowed, required) {
+  if (Object.keys(body).some(key => !allowed.includes(key)) || required.some(key => !Object.hasOwn(body, key))) {
+    throw new ApiError(400, `Expected fields: ${required.join(', ')}`);
+  }
+}
+
+function withCount(entity, pages) {
+  return { ...entity, diagramCount: pages.filter(page => page.entityId === entity.id).length };
 }
 
 // Run this checkout's original stdio server; one process multiplexes independent MCP calls.
@@ -92,6 +155,39 @@ await upstream.connect(new StdioClientTransport({
   stderr: 'inherit',
 }));
 
+function renderHtml(args, apiFilename = false, params = { name: 'visual_explainer_render_html' }) {
+  return catalog.run(async () => {
+    fields(args, ['filename', 'html', 'entityId'], ['filename', 'html']);
+    if (typeof args.filename !== 'string' || typeof args.html !== 'string' || !args.html.length) {
+      throw new ApiError(400, 'Send filename and nonempty html strings');
+    }
+    if (apiFilename) canonicalFilename(args.filename);
+    if (Object.hasOwn(args, 'entityId') && args.entityId !== null) catalog.entity(args.entityId);
+    // The renderer normalizes @, whitespace, extensions and kit source names.
+    // Assign its actual guarded output, never the caller's unnormalized input.
+    const existingFiles = new Set((await readdir(outputDir, { withFileTypes: true }))
+      .filter(entry => entry.isFile()).map(entry => entry.name));
+    const result = await upstream.callTool({
+      ...params,
+      arguments: { filename: args.filename, html: args.html, open: false },
+    }, undefined, { timeout: 180000 });
+    if (result.isError) return { render: result };
+    const path = result.structuredContent?.path;
+    if (typeof path !== 'string' || resolve(path) !== join(outputDir, basename(path))) {
+      throw new Error('Upstream returned a path outside the output directory');
+    }
+    const filename = pageFilename(basename(path));
+    if (apiFilename && filename !== args.filename) throw new Error('Upstream changed the API output filename');
+    const page = await requirePage(filename);
+    const assigned = Object.hasOwn(args, 'entityId') ? args.entityId : existingFiles.has(filename) ? catalog.assignment(filename) : null;
+    await catalog.assign(filename, assigned);
+    page.entityId = assigned;
+    result.structuredContent = { ...result.structuredContent, url: page.url, entityId: assigned };
+    result.content.push({ type: 'text', text: `View: ${page.url}\nThis link grants read access to this page. Reusing the filename replaces it; use unique filenames for immutable reports.` });
+    return { page, render: result, created: !existingFiles.has(filename) };
+  });
+}
+
 function proxyServer() {
   const server = new Server({ name: 'truenas-visual-explainer', version: bridgeVersion }, {
     capabilities: { tools: {}, resources: {}, prompts: {} }, instructions,
@@ -105,38 +201,32 @@ function proxyServer() {
         description: 'Render complete HTML or visual-explainer page source on TrueNAS and return a persistent browser URL. Send html, not a local filesystem path. No LLM; executable models disabled.',
         inputSchema: {
           type: 'object', additionalProperties: false,
-          properties: { filename: tool.inputSchema.properties.filename, html: tool.inputSchema.properties.html },
+          properties: {
+            filename: tool.inputSchema.properties.filename,
+            html: tool.inputSchema.properties.html,
+            entityId: { type: ['string', 'null'], description: 'Optional entity slug; omit to preserve the existing assignment, null to unassign.' },
+          },
           required: ['filename', 'html'],
         },
         outputSchema: {
           ...tool.outputSchema,
-          properties: { ...tool.outputSchema.properties, url: { type: 'string', format: 'uri' } },
+          properties: { ...tool.outputSchema.properties, url: { type: 'string', format: 'uri' }, entityId: { type: ['string', 'null'] } },
         },
       };
     }) };
   });
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    let params = request.params;
+    const params = request.params;
     if (params.name === 'visual_explainer_render_html') {
-      const args = params.arguments ?? {};
-      if (Object.keys(args).some((key) => !['filename', 'html'].includes(key)) ||
-          typeof args.filename !== 'string' || typeof args.html !== 'string') {
-        return { isError: true, content: [{ type: 'text', text: 'Send only filename and html strings; local paths, root and browser opening are not supported remotely.' }] };
+      try { return (await renderHtml(params.arguments ?? {}, false, params)).render; }
+      catch (error) {
+        if (!(error instanceof ApiError)) console.error(error);
+        return { isError: true, content: [{ type: 'text', text: error instanceof ApiError ? error.message : 'Unable to render and persist page assignment' }] };
       }
-      params = { ...params, arguments: { ...args, open: false } };
     }
     const result = await upstream.callTool(params, undefined, { timeout: 180000 });
     if (params.name === 'visual_explainer_prepare' && !result.isError) {
       result.content.push({ type: 'text', text: instructions });
-    }
-    if (params.name === 'visual_explainer_render_html' && !result.isError) {
-      const path = result.structuredContent?.path;
-      if (typeof path !== 'string' || resolve(path) !== join(outputDir, basename(path))) {
-        throw new Error('Upstream returned a path outside the output directory');
-      }
-      const url = pageUrl(basename(path));
-      result.structuredContent = { ...result.structuredContent, url };
-      result.content.push({ type: 'text', text: `View: ${url}\nThis link grants read access to this page. Reusing the filename replaces it; use unique filenames for immutable reports.` });
     }
     return result;
   });
@@ -151,7 +241,10 @@ const http = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, publicUrl);
     if (url.pathname === '/health' && req.method === 'GET') return send(res, 200, 'ok');
-    if (req.headers.host !== publicUrl.host) return send(res, 403, 'Unexpected Host');
+    if (req.headers.host !== publicUrl.host) {
+      if (url.pathname.startsWith('/api/') || url.pathname === '/mcp') throw new ApiError(403, 'Unexpected Host');
+      return send(res, 403, 'Unexpected Host');
+    }
     if (url.pathname.startsWith('/pages/') && ['GET', 'HEAD'].includes(req.method)) {
       const parts = url.pathname.split('/');
       if (parts.length !== 4) return send(res, 404, 'Not found');
@@ -190,48 +283,101 @@ const http = createServer(async (req, res) => {
       return send(res, 200, galleryHtml, 'text/html; charset=utf-8');
     }
     if (url.pathname === '/api/login' && req.method === 'POST') {
-      if (req.headers.origin !== publicUrl.origin) return send(res, 403, 'Unexpected Origin');
-      let body = '';
-      for await (const chunk of req) {
-        body += chunk.toString();
-        if (body.length > 1024) return send(res, 413, 'Request too large');
-      }
-      const key = new URLSearchParams(body).get('key') ?? '';
-      if (!equal(key, viewerKey) && !equal(key, token)) return send(res, 401, '访问密钥不正确');
+      if (req.headers.origin !== publicUrl.origin) throw new ApiError(403, 'Unexpected Origin');
+      const key = new URLSearchParams(await readBody(req, 1024)).get('key') ?? '';
+      if (!equal(key, viewerKey) && !equal(key, token)) throw new ApiError(401, '访问密钥不正确');
       setViewerSession(res);
       return send(res, 200, 'ok');
     }
     if (url.pathname === '/api/logout' && req.method === 'POST') {
-      if (req.headers.origin !== publicUrl.origin) return send(res, 403, 'Unexpected Origin');
+      if (req.headers.origin !== publicUrl.origin) throw new ApiError(403, 'Unexpected Origin');
       res.setHeader('Set-Cookie', 've_viewer=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0');
       return send(res, 200, 'ok');
     }
-    if (url.pathname === '/api/pages' && req.method === 'GET') {
-      if (!viewerSession(req)) return send(res, 401, '请先登录');
-      return send(res, 200, JSON.stringify({ pages: await listPages() }), 'application/json; charset=utf-8');
+    if (url.pathname.startsWith('/api/')) {
+      const service = equal(req.headers.authorization ?? '', `Bearer ${token}`);
+      if (req.method === 'GET' ? !service && !viewerSession(req) : !service) throw new ApiError(401, 'Authentication required');
+      if (req.headers.origin && req.headers.origin !== publicUrl.origin) throw new ApiError(403, 'Unexpected Origin');
+      let parts;
+      try { parts = url.pathname.split('/').slice(2).map(decodeURIComponent); }
+      catch { throw new ApiError(400, 'Invalid URL encoding'); }
+      const [resource, id] = parts;
+      if (resource === 'entities' && parts.length === 1 && req.method === 'GET') {
+        return await catalog.run(async () => {
+          const pages = await listPages();
+          return json(res, 200, {
+            entities: catalog.entities().map(entity => withCount(entity, pages)),
+            unassignedCount: pages.filter(page => page.entityId === null).length,
+            totalCount: pages.length,
+          });
+        });
+      }
+      if (resource === 'entities' && parts.length === 1 && req.method === 'POST') {
+        const body = await readJson(req, 4096);
+        fields(body, ['id', 'name'], ['id', 'name']);
+        return await catalog.run(async () => json(res, 201, { entity: withCount(await catalog.create(body.id, body.name), await listPages()) }));
+      }
+      if (resource === 'entities' && parts.length === 2 && req.method === 'PATCH') {
+        const body = await readJson(req, 4096);
+        fields(body, ['name'], ['name']);
+        return await catalog.run(async () => json(res, 200, { entity: withCount(await catalog.rename(id, body.name), await listPages()) }));
+      }
+      if (resource === 'entities' && parts.length === 2 && req.method === 'DELETE') {
+        return await catalog.run(async () => {
+          await catalog.remove(id, await listPages());
+          return send(res, 204, '');
+        });
+      }
+      if (resource === 'pages' && parts.length === 1 && req.method === 'GET') {
+        return await catalog.run(async () => {
+          const filter = url.searchParams.get('entityId');
+          if (filter !== null && filter !== '') catalog.entity(filter);
+          const pages = await listPages();
+          return json(res, 200, { pages: filter === null ? pages : pages.filter(page => page.entityId === (filter || null)) });
+        });
+      }
+      if (resource === 'pages' && parts.length === 2 && req.method === 'GET') {
+        return await catalog.run(async () => json(res, 200, { page: await requirePage(id) }));
+      }
+      if (resource === 'pages' && parts.length === 2 && req.method === 'PATCH') {
+        const body = await readJson(req, 4096);
+        fields(body, ['entityId'], ['entityId']);
+        return await catalog.run(async () => {
+          const page = await requirePage(id);
+          await catalog.assign(id, body.entityId);
+          return json(res, 200, { page: { ...page, entityId: body.entityId } });
+        });
+      }
+      if (resource === 'pages' && parts.length === 2 && req.method === 'PUT') {
+        canonicalFilename(id);
+        const body = await readJson(req, 12 * 1024 * 1024);
+        fields(body, ['html', 'entityId'], ['html']);
+        const result = await renderHtml({ ...body, filename: id }, true);
+        if (result.render.isError) {
+          throw new ApiError(400, result.render.content.filter(item => item.type === 'text').map(item => item.text).join('\n') || 'Rendering failed');
+        }
+        return json(res, result.created ? 201 : 200, { page: result.page, render: result.render });
+      }
+      throw new ApiError(404, 'Not found');
     }
     if (url.pathname !== '/mcp') return send(res, 404, 'Not found');
-    if (!equal(req.headers.authorization ?? '', `Bearer ${token}`)) return send(res, 401, 'Bearer token required');
-    if (req.headers.origin && req.headers.origin !== publicUrl.origin) return send(res, 403, 'Unexpected Origin');
-    if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); return send(res, 405, 'Use stateless MCP POST'); }
-    const chunks = [];
-    let size = 0;
-    for await (const chunk of req) {
-      size += chunk.length;
-      if (size > 12 * 1024 * 1024) return send(res, 413, 'Request exceeds 12 MiB');
-      chunks.push(chunk);
-    }
-    let body;
-    try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
-    catch { return send(res, 400, 'Invalid JSON'); }
+    if (!equal(req.headers.authorization ?? '', `Bearer ${token}`)) throw new ApiError(401, 'Bearer token required');
+    if (req.headers.origin && req.headers.origin !== publicUrl.origin) throw new ApiError(403, 'Unexpected Origin');
+    if (req.method !== 'POST') { res.setHeader('Allow', 'POST'); throw new ApiError(405, 'Use stateless MCP POST'); }
+    const body = await readJson(req, 12 * 1024 * 1024);
     const server = proxyServer();
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { void server.close().catch(console.error); });
     await server.connect(transport);
     await transport.handleRequest(req, res, body);
   } catch (error) {
-    console.error(error);
-    if (!res.headersSent) send(res, 500, 'Internal server error');
+    if (!(error instanceof ApiError)) console.error(error);
+    if (!res.headersSent) {
+      const status = error instanceof ApiError ? error.status : 500;
+      const message = error instanceof ApiError ? error.message : 'Internal server error';
+      if (req.url?.startsWith('/api/') || req.url?.startsWith('/mcp')) json(res, status, { error: message });
+      else send(res, status, message);
+    }
     else res.end();
   }
 });

@@ -14,7 +14,7 @@ COPY package.json LICENSE /opt/upstream/
 COPY plugins/ /opt/upstream/plugins/
 # Share only MCP/render dependencies; do not install unused PPTX export dependencies.
 RUN ln -s /opt/bridge/node_modules /opt/upstream/node_modules
-COPY remote-app/server.mjs remote-app/index.html ./
+COPY remote-app/server.mjs remote-app/catalog.mjs remote-app/index.html ./
 COPY remote-app/static/ ./static/
 ARG SOURCE_REVISION
 LABEL org.opencontainers.image.source="https://github.com/ylang-ylang/visual-explainer" \
