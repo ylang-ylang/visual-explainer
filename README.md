@@ -12,7 +12,7 @@ The original skill, prompts and renderer remain under `plugins/visual-explainer/
 The additions in **`remote-app/` are fork features, not an upstream Web UI**:
 
 - Bearer-authenticated Streamable HTTP MCP at `/mcp`, retaining the original tools, resources and prompts.
-- A private visual library at `/`: history, search, interactive preview, desktop/mobile widths, fullscreen and standalone viewing.
+- A private, light, full-window visual library at `/`: collapsible desktop navigation, a mobile library drawer, history, search, interactive preview, desktop/mobile widths, fullscreen and standalone viewing.
 - Persistent HTML/source files and signed per-page browser links. New agent renders appear in the library automatically.
 - No model API, credentials or inference on the server. The working agent inspects its project and supplies HTML.
 

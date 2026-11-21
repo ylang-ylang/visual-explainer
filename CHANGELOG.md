@@ -1,5 +1,11 @@
 # Changelog
 
+## Fork UI refresh - 2026-11-21
+
+- Replaced the gallery with a light, full-window reader: collapsible desktop navigation and a mobile library drawer.
+- Removed introductory chrome to give diagrams more space; retained authentication, search, refresh, deep links, isolated previews and viewing tools.
+- Added keyboard navigation and explicit loading, connection and preview-error states without changing generated diagrams.
+
 ## Fork remote app 1.1.0 - 2026-11-20
 
 - Added `remote-app/`: authenticated remote MCP, signed page links and a private human-facing visual library.
