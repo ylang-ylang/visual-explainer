@@ -4,7 +4,13 @@
 
 # visual-explainer
 
-## Maintained fork: remote MCP + Web UI
+## Historical fork: Web UI moved
+
+The maintained Web UI, Entity API and TrueNAS deployment now live in the independent
+[visual-explainer-webui](https://github.com/ylang-ylang/visual-explainer-webui) repository.
+It installs the unmodified official renderer as an integrity-locked dependency,
+with tested upstream-update PRs. This fork is retained for history; the fork-specific
+deployment instructions below describe the previous implementation.
 
 This is [ylang-ylang's fork](https://github.com/ylang-ylang/visual-explainer) of
 [nicobailon/visual-explainer](https://github.com/nicobailon/visual-explainer).
